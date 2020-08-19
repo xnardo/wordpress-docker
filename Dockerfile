@@ -1,4 +1,15 @@
-FROM php:7.3-alpine
+FROM php:7.3-fpm-alpine
+
+# persistent dependencies
+RUN apk add --no-cache \
+# in theory, docker-entrypoint.sh is POSIX-compliant, but priority is a working, consistent image
+		bash \
+# BusyBox sed is not sufficient for some of our sed expressions
+		sed \
+# Ghostscript is required for rendering PDF previews
+		ghostscript \
+# Alpine package for "imagemagick" contains ~120 .so files, see: https://github.com/docker-library/wordpress/pull/497
+		imagemagick
 
 # install the PHP extensions we need (https://make.wordpress.org/hosting/handbook/handbook/server-environment/#php-extensions)
 RUN set -ex; \
@@ -33,7 +44,16 @@ RUN set -ex; \
 	apk del .build-deps
 
 # set recommended PHP.ini settings
-# excluding opcache due https://github.com/docker-library/wordpress/issues/407
+# see https://secure.php.net/manual/en/opcache.installation.php
+RUN set -eux; \
+	docker-php-ext-enable opcache; \
+	{ \
+		echo 'opcache.memory_consumption=128'; \
+		echo 'opcache.interned_strings_buffer=8'; \
+		echo 'opcache.max_accelerated_files=4000'; \
+		echo 'opcache.revalidate_freq=2'; \
+		echo 'opcache.fast_shutdown=1'; \
+	} > /usr/local/etc/php/conf.d/opcache-recommended.ini
 # https://wordpress.org/support/article/editing-wp-config-php/#configure-error-logging
 RUN { \
 # https://www.php.net/manual/en/errorfunc.constants.php
@@ -49,53 +69,29 @@ RUN { \
 		echo 'html_errors = Off'; \
 	} > /usr/local/etc/php/conf.d/error-logging.ini
 
-# install wp-cli dependencies
-RUN apk add --no-cache \
-# bash is needed for 'wp shell': https://github.com/wp-cli/shell-command/blob/b8dafcc2a2eba5732fdee70be077675a302848e9/src/WP_CLI/REPL.php#L104
-		bash \
-		less \
-		mysql-client
+
+ENV WORDPRESS_VERSION 5.5
+ENV WORDPRESS_SHA1 03fe1a139b3cd987cc588ba95fab2460cba2a89e
 
 RUN set -ex; \
-	mkdir -p /var/www/html; \
-	chown -R www-data:www-data /var/www/html
-WORKDIR /var/www/html
-
-# https://make.wordpress.org/cli/2018/05/31/gpg-signature-change/
-# pub   rsa2048 2018-05-31 [SC]
-#       63AF 7AA1 5067 C056 16FD  DD88 A3A2 E8F2 26F0 BC06
-# uid           [ unknown] WP-CLI Releases <releases@wp-cli.org>
-# sub   rsa2048 2018-05-31 [E]
-ENV WORDPRESS_CLI_GPG_KEY 63AF7AA15067C05616FDDD88A3A2E8F226F0BC06
-
-ENV WORDPRESS_CLI_VERSION 2.4.0
-ENV WORDPRESS_CLI_SHA512 4049c7e45e14276a70a41c3b0864be7a6a8cfa8ea65ebac8b184a4f503a91baa1a0d29260d03248bc74aef70729824330fb6b396336172a624332e16f64e37ef
-
-RUN set -ex; \
-	\
-	apk add --no-cache --virtual .fetch-deps \
-		gnupg \
-	; \
-	\
-	curl -o /usr/local/bin/wp.gpg -fSL "https://github.com/wp-cli/wp-cli/releases/download/v${WORDPRESS_CLI_VERSION}/wp-cli-${WORDPRESS_CLI_VERSION}.phar.gpg"; \
-	\
-	export GNUPGHOME="$(mktemp -d)"; \
-	gpg --batch --keyserver ha.pool.sks-keyservers.net --recv-keys "$WORDPRESS_CLI_GPG_KEY"; \
-	gpg --batch --decrypt --output /usr/local/bin/wp /usr/local/bin/wp.gpg; \
-	command -v gpgconf && gpgconf --kill all || :; \
-	rm -rf "$GNUPGHOME" /usr/local/bin/wp.gpg; \
-	\
-	echo "$WORDPRESS_CLI_SHA512 */usr/local/bin/wp" | sha512sum -c -; \
-	chmod +x /usr/local/bin/wp; \
-	\
-	apk del .fetch-deps; \
-	\
-	wp --allow-root --version
+	curl -o wordpress.tar.gz -fSL "https://wordpress.org/wordpress-${WORDPRESS_VERSION}.tar.gz"; \
+	echo "$WORDPRESS_SHA1 *wordpress.tar.gz" | sha1sum -c -; \
+# upstream tarballs include ./wordpress/ so this gives us /usr/src/wordpress
+	tar -xzf wordpress.tar.gz -C /usr/src/; \
+	rm wordpress.tar.gz; \
+	chown -R www-data:www-data /usr/src/wordpress; \
+# pre-create wp-content (and single-level children) for folks who want to bind-mount themes, etc so permissions are pre-created properly instead of root:root
+	mkdir wp-content; \
+	for dir in /usr/src/wordpress/wp-content/*/; do \
+		dir="$(basename "${dir%/}")"; \
+		mkdir "wp-content/$dir"; \
+	done; \
+	chown -R www-data:www-data wp-content; \
+	chmod -R 777 wp-content
 
 VOLUME /var/www/html
 
 COPY docker-entrypoint.sh /usr/local/bin/
 
 ENTRYPOINT ["docker-entrypoint.sh"]
-USER www-data
-CMD ["wp", "shell"]
+CMD ["php-fpm"]
